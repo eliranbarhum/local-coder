@@ -1,164 +1,304 @@
 #!/usr/bin/env python3
 """
-local-coder: installer and manager for offline LLM-assisted coding
-Tools: Ollama, Aider, Goose  |  Default model: qwen2.5-coder:7b
+local-coder: offline LLM-assisted coding
+Default backend: llama.cpp (llama-server)
+Optional backend: Ollama (--backend ollama)
 """
 
 import argparse
-import json
-import os
-import platform
-import shutil
-import subprocess
 import sys
-import tempfile
-import time
-import urllib.request
 from pathlib import Path
 
 from config import (
-    AIDER_WRAPPER_TEMPLATE,
-    BASE_MODEL,
-    DEFAULT_CONTEXT_SIZE,
-    DEFAULT_MODEL_ALIAS,
-    GOOSE_WRAPPER_TEMPLATE,
+    DEFAULT_MODEL,
     KNOWN_MODELS,
+    LLAMA_SERVER_HOST,
+    LLAMA_SERVER_PORT,
+    MODELS_DIR,
     OLLAMA_DEFAULT_PORT,
-    OLLAMA_DOCKER_IMAGE,
-    OLLAMA_MIN_VERSION,
+    ACTIVE_MODEL_FILE,
 )
 from install.aider import install_aider, write_aider_wrapper
 from install.goose import install_goose, write_goose_wrapper
-from install.model import create_model, delete_model, list_models, pull_base_model, set_active_model
+from install.llama import download_binary, is_running, start_server, stop_server
+from install.model import (
+    delete_model,
+    download_gguf,
+    get_active_model,
+    get_model_ctx,
+    get_model_path,
+    list_local_models,
+    ollama_create,
+    ollama_delete,
+    ollama_list,
+    ollama_pull,
+    register_model,
+    set_active_model,
+)
 from install.ollama import ensure_ollama, ollama_health
 
 
 def cmd_install(args):
-    print("\n=== local-coder setup ===\n")
+    backend = args.backend
+    print(f"\n=== local-coder setup (backend: {backend}) ===\n")
 
-    if not ensure_ollama(port=args.port, docker=not args.native):
-        print("[error] Could not start Ollama. Aborting.")
-        sys.exit(1)
-
-    base = args.base_model or BASE_MODEL
-    alias = args.alias or DEFAULT_MODEL_ALIAS
-    ctx = args.ctx or DEFAULT_CONTEXT_SIZE
-
-    if not args.skip_model:
-        pull_base_model(base, port=args.port)
-        create_model(alias, base, ctx, port=args.port)
-        set_active_model(alias)
+    if backend == "llama":
+        _install_llama(args)
+    else:
+        _install_ollama(args)
 
     if not args.skip_aider:
         install_aider()
-        write_aider_wrapper(alias, port=args.port)
-
     if not args.skip_goose:
         install_goose()
-        write_goose_wrapper(alias, port=args.port)
+
+    alias = _get_alias(args)
+    write_aider_wrapper(alias, backend=backend, port=_get_port(args))
+    write_goose_wrapper(alias, backend=backend, port=_get_port(args))
 
     print("\n[done] Setup complete.")
     print(f"  aider-local [files]           — Aider with {alias}")
     print(f"  goose-local run -t \"...\"       — Goose one-shot task")
-    print(f"  python setup.py status        — check everything is running")
-    print(f"  python setup.py model list    — see installed models")
+    print(f"  python setup.py status        — check everything")
+    print(f"  python setup.py model list    — installed models")
+    print(f"  python setup.py model switch  — change active model")
+
+
+def _install_llama(args):
+    download_binary()
+
+    preset_name = args.model or DEFAULT_MODEL
+    preset = _resolve_preset(preset_name)
+    alias = args.alias or preset["alias"]
+    ctx = args.ctx or preset["ctx"]
+
+    if not args.skip_model:
+        hf_repo = args.hf_repo or preset.get("hf_repo")
+        hf_file = args.hf_file or preset.get("hf_file")
+        model_path = download_gguf(preset_name, hf_repo=hf_repo, hf_file=hf_file)
+        register_model(preset_name, model_path, alias, ctx)
+        set_active_model(alias)
+        start_server(model_path, ctx, port=args.port or LLAMA_SERVER_PORT)
+    else:
+        # try to start with whatever is active
+        active = get_active_model()
+        model_path = get_model_path(active)
+        if model_path:
+            ctx = get_model_ctx(active)
+            start_server(model_path, ctx, port=args.port or LLAMA_SERVER_PORT)
+
+
+def _install_ollama(args):
+    port = args.port or OLLAMA_DEFAULT_PORT
+    if not ensure_ollama(port=port, docker=True):
+        print("[error] Could not start Ollama.")
+        sys.exit(1)
+
+    preset_name = args.model or DEFAULT_MODEL
+    preset = _resolve_preset(preset_name)
+    alias = args.alias or preset.get("ollama_tag", preset_name).replace(":", "-") + "-local"
+    ctx = args.ctx or preset.get("ollama_ctx", 16384)
+    tag = preset.get("ollama_tag", preset_name)
+
+    if not args.skip_model:
+        ollama_pull(tag, port=port)
+        ollama_create(alias, tag, ctx, port=port)
+        set_active_model(alias)
 
 
 def cmd_status(args):
-    port = args.port or OLLAMA_DEFAULT_PORT
-    print(f"\nOllama  : ", end="")
-    if ollama_health(port):
-        print(f"running on :{port}")
+    backend = _detect_backend()
+    print(f"\nBackend : {backend}")
+
+    if backend == "llama":
+        port = args.port or LLAMA_SERVER_PORT
+        running = is_running(port)
+        print(f"Server  : {'running on :' + str(port) if running else 'stopped'}")
+        print(f"Models  : {MODELS_DIR}")
+        active = get_active_model()
+        for m in list_local_models():
+            tag = " <-- active" if m["alias"] == active else ""
+            size = _file_size(Path(m["path"]))
+            print(f"  {m['alias']:<30} {size}{tag}")
     else:
-        print("not running")
-        return
+        port = args.port or OLLAMA_DEFAULT_PORT
+        running = ollama_health(port)
+        print(f"Ollama  : {'running on :' + str(port) if running else 'stopped'}")
+        if running:
+            active = get_active_model()
+            for m in ollama_list(port):
+                tag = " <-- active" if m["name"].split(":")[0] == active else ""
+                print(f"  {m['name']:<35} ({_human_size(m['size'])}){tag}")
 
-    print("Models  :")
-    for m in list_models(port):
-        active = " <-- active" if m["name"] == _read_active_model() else ""
-        print(f"  {m['name']}  ({_human_size(m['size'])}){active}")
-
-    print("Aider   :", shutil.which("aider-local") or "not found")
-    print("Goose   :", shutil.which("goose-local") or "not found")
+    from shutil import which
+    print(f"Aider   : {which('aider-local') or 'not installed'}")
+    print(f"Goose   : {which('goose-local') or 'not installed'}")
     print()
 
 
+def cmd_server(args):
+    if args.server_cmd == "start":
+        active = get_active_model()
+        model_path = get_model_path(active)
+        if not model_path:
+            print(f"[error] No model found for '{active}'. Run: python setup.py model list")
+            sys.exit(1)
+        ctx = get_model_ctx(active)
+        start_server(model_path, ctx, port=args.port or LLAMA_SERVER_PORT)
+
+    elif args.server_cmd == "stop":
+        stop_server()
+
+    elif args.server_cmd == "restart":
+        stop_server()
+        import time; time.sleep(1)
+        active = get_active_model()
+        model_path = get_model_path(active)
+        if model_path:
+            ctx = get_model_ctx(active)
+            start_server(model_path, ctx, port=args.port or LLAMA_SERVER_PORT)
+
+    elif args.server_cmd == "status":
+        port = args.port or LLAMA_SERVER_PORT
+        if is_running(port):
+            print(f"[llama] Running on :{port}, model={get_active_model()}")
+        else:
+            print("[llama] Not running.")
+
+
 def cmd_model(args):
-    port = args.port or OLLAMA_DEFAULT_PORT
+    backend = args.backend or _detect_backend()
+    port = args.port or (LLAMA_SERVER_PORT if backend == "llama" else OLLAMA_DEFAULT_PORT)
 
     if args.model_cmd == "list":
-        if not ollama_health(port):
-            print("[error] Ollama is not running.")
-            sys.exit(1)
-        for m in list_models(port):
-            active = " <-- active" if m["name"] == _read_active_model() else ""
-            print(f"  {m['name']}  ({_human_size(m['size'])}){active}")
-
-    elif args.model_cmd == "add":
-        # Pull a known preset or a raw Ollama model tag
-        base = args.base or args.name
-        alias = args.alias or args.name.replace(":", "-").replace("/", "-")
-        ctx = args.ctx or DEFAULT_CONTEXT_SIZE
-
-        if not ollama_health(port):
-            print("[error] Ollama is not running.")
-            sys.exit(1)
-
-        if args.name in KNOWN_MODELS:
-            preset = KNOWN_MODELS[args.name]
-            base = preset["base"]
-            ctx = args.ctx or preset["ctx"]
-            alias = args.alias or preset["alias"]
-            print(f"[model] Using preset '{args.name}': base={base}, ctx={ctx}, alias={alias}")
-
-        pull_base_model(base, port=port)
-        create_model(alias, base, ctx, port=port)
-
-        if args.activate:
-            _switch_to(alias, port)
-
-    elif args.model_cmd == "switch":
-        _switch_to(args.name, port)
-
-    elif args.model_cmd == "remove":
-        delete_model(args.name, port=port)
-        print(f"[model] Removed {args.name}")
+        active = get_active_model()
+        if backend == "llama":
+            models = list_local_models()
+            if not models:
+                print("No models downloaded yet.")
+            for m in models:
+                tag = " <-- active" if m["alias"] == active else ""
+                size = _file_size(Path(m["path"]))
+                print(f"  {m['alias']:<30} {size}  ctx={m['ctx']}{tag}")
+        else:
+            for m in ollama_list(port):
+                tag = " <-- active" if m["name"].split(":")[0] == active else ""
+                print(f"  {m['name']:<35} ({_human_size(m['size'])}){tag}")
 
     elif args.model_cmd == "presets":
-        print("\nKnown model presets:\n")
-        print(f"  {'NAME':<28} {'BASE':<35} {'CTX'}")
-        print("  " + "-" * 72)
+        print(f"\n{'NAME':<25} {'ALIAS':<25} {'SIZE':>6}  {'CTX':>6}  DESCRIPTION")
+        print("-" * 85)
         for name, p in KNOWN_MODELS.items():
-            print(f"  {name:<28} {p['base']:<35} {p['ctx']}")
+            print(f"{name:<25} {p['alias']:<25} {p['size_gb']:>5.1f}GB  {p['ctx']:>6}  {p['description']}")
         print()
 
+    elif args.model_cmd == "add":
+        preset_name = args.name
+        preset = _resolve_preset(preset_name, allow_unknown=True)
+        alias = args.alias or preset.get("alias", preset_name.replace(":", "-"))
+        ctx = args.ctx or preset.get("ctx", 16384)
 
-def _switch_to(alias, port):
-    models = [m["name"].split(":")[0] for m in list_models(port)]
-    if alias not in models and f"{alias}:latest" not in [m["name"] for m in list_models(port)]:
-        print(f"[error] Model '{alias}' not found. Run: python setup.py model list")
-        sys.exit(1)
-    set_active_model(alias)
-    write_aider_wrapper(alias, port=port)
-    write_goose_wrapper(alias, port=port)
-    print(f"[model] Switched to {alias}. Wrappers updated.")
+        if backend == "llama":
+            hf_repo = args.hf_repo or preset.get("hf_repo")
+            hf_file = args.hf_file or preset.get("hf_file")
+            if not hf_repo or not hf_file:
+                print("[error] Unknown preset. Provide --hf-repo and --hf-file.")
+                sys.exit(1)
+            model_path = download_gguf(preset_name, hf_repo=hf_repo, hf_file=hf_file)
+            register_model(preset_name, model_path, alias, ctx)
+            if args.activate:
+                _switch_llama(alias, port)
+        else:
+            tag = preset.get("ollama_tag", preset_name)
+            ollama_pull(tag, port=port)
+            ollama_create(alias, tag, ctx, port=port)
+            if args.activate:
+                _switch_ollama(alias, port)
+
+    elif args.model_cmd == "switch":
+        if backend == "llama":
+            _switch_llama(args.name, port)
+        else:
+            _switch_ollama(args.name, port)
+
+    elif args.model_cmd == "remove":
+        if backend == "llama":
+            delete_model(args.name)
+        else:
+            ollama_delete(args.name, port=port)
+            print(f"[model] Removed {args.name}")
 
 
 def cmd_uninstall(args):
-    for w in ["aider-local", "goose-local"]:
-        p = Path("/usr/local/bin") / w
-        if p.exists():
-            p.unlink()
-            print(f"[removed] {p}")
-    print("[info] Ollama container/process not removed. Stop it manually if needed.")
+    stop_server()
+    from config import AIDER_WRAPPER, GOOSE_WRAPPER
+    for w in [AIDER_WRAPPER, GOOSE_WRAPPER]:
+        if w.exists():
+            w.unlink()
+            print(f"[removed] {w}")
+    print("[info] Models and binaries in ~/.local-coder are kept. Delete manually if needed.")
 
 
-def _read_active_model():
-    p = Path.home() / ".local-coder" / "active_model"
-    return p.read_text().strip() if p.exists() else DEFAULT_MODEL_ALIAS
+def _switch_llama(alias: str, port: int):
+    model_path = get_model_path(alias)
+    if not model_path:
+        print(f"[error] '{alias}' not found. Run: python setup.py model list")
+        sys.exit(1)
+    ctx = get_model_ctx(alias)
+    stop_server()
+    import time; time.sleep(1)
+    start_server(model_path, ctx, port=port)
+    set_active_model(alias)
+    backend = _detect_backend()
+    write_aider_wrapper(alias, backend=backend, port=port)
+    write_goose_wrapper(alias, backend=backend, port=port)
+    print(f"[model] Switched to {alias}. Server restarted, wrappers updated.")
 
 
-def _human_size(b):
+def _switch_ollama(alias: str, port: int):
+    set_active_model(alias)
+    write_aider_wrapper(alias, backend="ollama", port=port)
+    write_goose_wrapper(alias, backend="ollama", port=port)
+    print(f"[model] Switched to {alias}. Wrappers updated.")
+
+
+def _detect_backend() -> str:
+    # If llama-server is running, it's llama; otherwise check Ollama
+    if is_running(LLAMA_SERVER_PORT):
+        return "llama"
+    if ollama_health(OLLAMA_DEFAULT_PORT):
+        return "ollama"
+    return "llama"  # default
+
+
+def _resolve_preset(name: str, allow_unknown=False) -> dict:
+    if name in KNOWN_MODELS:
+        return KNOWN_MODELS[name]
+    if allow_unknown:
+        return {}
+    print(f"[error] Unknown preset '{name}'. Run: python setup.py model presets")
+    sys.exit(1)
+
+
+def _get_alias(args) -> str:
+    preset = _resolve_preset(args.model or DEFAULT_MODEL)
+    return args.alias or preset.get("alias", "local-model")
+
+
+def _get_port(args) -> int:
+    backend = getattr(args, "backend", "llama")
+    default = LLAMA_SERVER_PORT if backend == "llama" else OLLAMA_DEFAULT_PORT
+    return getattr(args, "port", None) or default
+
+
+def _file_size(p: Path) -> str:
+    if not p.exists():
+        return "missing"
+    b = p.stat().st_size
+    return _human_size(b)
+
+
+def _human_size(b: int) -> str:
     for unit in ["B", "KB", "MB", "GB"]:
         if b < 1024:
             return f"{b:.1f}{unit}"
@@ -168,49 +308,65 @@ def _human_size(b):
 
 def main():
     parser = argparse.ArgumentParser(prog="setup.py", description="local-coder manager")
-    parser.add_argument("--port", type=int, default=OLLAMA_DEFAULT_PORT)
+
     sub = parser.add_subparsers(dest="cmd")
 
-    # install
-    p_install = sub.add_parser("install", help="full setup")
-    p_install.add_argument("--native", action="store_true", help="install Ollama natively instead of Docker")
-    p_install.add_argument("--base-model", help=f"base model to pull (default: {BASE_MODEL})")
-    p_install.add_argument("--alias", help=f"alias for the custom model (default: {DEFAULT_MODEL_ALIAS})")
-    p_install.add_argument("--ctx", type=int, help=f"context window size (default: {DEFAULT_CONTEXT_SIZE})")
-    p_install.add_argument("--skip-model", action="store_true")
-    p_install.add_argument("--skip-aider", action="store_true")
-    p_install.add_argument("--skip-goose", action="store_true")
-    p_install.set_defaults(func=cmd_install)
+    # ── install ────────────────────────────────────────────────────────────────
+    p_i = sub.add_parser("install", help="full setup")
+    p_i.add_argument("--backend", choices=["llama", "ollama"], default="llama")
+    p_i.add_argument("--model", help=f"preset name (default: {DEFAULT_MODEL})")
+    p_i.add_argument("--alias", help="custom name for this model")
+    p_i.add_argument("--ctx", type=int, help="context window size")
+    p_i.add_argument("--port", type=int)
+    p_i.add_argument("--hf-repo", dest="hf_repo", help="HuggingFace repo (llama backend)")
+    p_i.add_argument("--hf-file", dest="hf_file", help="GGUF filename in the repo")
+    p_i.add_argument("--skip-model", action="store_true")
+    p_i.add_argument("--skip-aider", action="store_true")
+    p_i.add_argument("--skip-goose", action="store_true")
+    p_i.set_defaults(func=cmd_install)
 
-    # status
-    p_status = sub.add_parser("status", help="show what is running")
-    p_status.set_defaults(func=cmd_status)
+    # ── status ─────────────────────────────────────────────────────────────────
+    p_s = sub.add_parser("status", help="show what is running")
+    p_s.add_argument("--port", type=int)
+    p_s.set_defaults(func=cmd_status)
 
-    # model
-    p_model = sub.add_parser("model", help="manage models")
-    p_model.add_argument("--port", type=int)
-    ms = p_model.add_subparsers(dest="model_cmd")
+    # ── server ─────────────────────────────────────────────────────────────────
+    p_srv = sub.add_parser("server", help="manage llama-server process")
+    p_srv.add_argument("--port", type=int)
+    srv_sub = p_srv.add_subparsers(dest="server_cmd")
+    srv_sub.add_parser("start")
+    srv_sub.add_parser("stop")
+    srv_sub.add_parser("restart")
+    srv_sub.add_parser("status")
+    p_srv.set_defaults(func=cmd_server)
 
-    ms.add_parser("list", help="list installed models")
-    ms.add_parser("presets", help="show known model presets")
+    # ── model ──────────────────────────────────────────────────────────────────
+    p_m = sub.add_parser("model", help="manage models")
+    p_m.add_argument("--backend", choices=["llama", "ollama"])
+    p_m.add_argument("--port", type=int)
+    m_sub = p_m.add_subparsers(dest="model_cmd")
 
-    p_add = ms.add_parser("add", help="pull and register a model")
-    p_add.add_argument("name", help="preset name or ollama model tag (e.g. deepseek-coder:6.7b)")
-    p_add.add_argument("--base", help="override base model tag")
-    p_add.add_argument("--alias", help="alias for wrapper scripts")
-    p_add.add_argument("--ctx", type=int, help="context window size")
-    p_add.add_argument("--activate", action="store_true", help="switch wrappers to this model after adding")
+    m_sub.add_parser("list")
+    m_sub.add_parser("presets")
 
-    p_switch = ms.add_parser("switch", help="switch active model (updates wrappers)")
-    p_switch.add_argument("name", help="model alias to activate")
+    p_add = m_sub.add_parser("add", help="download and register a model")
+    p_add.add_argument("name", help="preset name or HuggingFace model tag")
+    p_add.add_argument("--alias")
+    p_add.add_argument("--ctx", type=int)
+    p_add.add_argument("--hf-repo", dest="hf_repo")
+    p_add.add_argument("--hf-file", dest="hf_file")
+    p_add.add_argument("--activate", action="store_true")
 
-    p_remove = ms.add_parser("remove", help="delete a model from Ollama")
-    p_remove.add_argument("name")
+    p_sw = m_sub.add_parser("switch", help="switch active model (restarts server, updates wrappers)")
+    p_sw.add_argument("name")
 
-    p_model.set_defaults(func=cmd_model)
+    p_rm = m_sub.add_parser("remove", help="delete a model")
+    p_rm.add_argument("name")
 
-    # uninstall
-    p_un = sub.add_parser("uninstall", help="remove wrapper scripts")
+    p_m.set_defaults(func=cmd_model)
+
+    # ── uninstall ──────────────────────────────────────────────────────────────
+    p_un = sub.add_parser("uninstall", help="stop server and remove wrappers")
     p_un.set_defaults(func=cmd_uninstall)
 
     args = parser.parse_args()

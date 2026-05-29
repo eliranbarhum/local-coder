@@ -1,13 +1,18 @@
 import json
-import os
 import stat
 import sys
 import urllib.request
 from pathlib import Path
 
-from config import GOOSE_WRAPPER_TEMPLATE, OLLAMA_DEFAULT_PORT
+from config import (
+    GOOSE_WRAPPER,
+    GOOSE_WRAPPER_LLAMA,
+    GOOSE_WRAPPER_OLLAMA,
+    LLAMA_SERVER_HOST,
+    LLAMA_SERVER_PORT,
+    OLLAMA_DEFAULT_PORT,
+)
 
-WRAPPER_PATH = Path("/usr/local/bin/goose-local")
 GOOSE_BINARY = Path.home() / ".local/bin/goose"
 GOOSE_RELEASES_URL = "https://api.github.com/repos/block/goose/releases/latest"
 
@@ -17,35 +22,48 @@ def install_goose():
         print(f"[goose] Already installed at {GOOSE_BINARY}")
         return
 
-    print("[goose] Fetching latest release info...")
-    asset_url = _get_release_asset_url()
+    print("[goose] Fetching latest release...")
+    asset_url = _find_release_asset()
     if not asset_url:
-        print("[goose] Could not find a Linux x86_64 binary. Install manually from https://github.com/block/goose/releases")
+        print("[goose] Could not find Linux x86_64 binary.")
+        print("        Install manually: https://github.com/block/goose/releases")
         sys.exit(1)
 
-    print(f"[goose] Downloading {asset_url}...")
+    print(f"[goose] Downloading...")
     GOOSE_BINARY.parent.mkdir(parents=True, exist_ok=True)
     urllib.request.urlretrieve(asset_url, GOOSE_BINARY)
     GOOSE_BINARY.chmod(GOOSE_BINARY.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    print(f"[goose] Installed to {GOOSE_BINARY}")
+    print(f"[goose] Installed at {GOOSE_BINARY}")
 
 
-def write_goose_wrapper(model: str, port=OLLAMA_DEFAULT_PORT):
-    content = GOOSE_WRAPPER_TEMPLATE.format(model=model, port=port)
-    WRAPPER_PATH.write_text(content)
-    WRAPPER_PATH.chmod(0o755)
-    print(f"[goose] Wrapper written to {WRAPPER_PATH} (model={model})")
+def write_goose_wrapper(alias: str, backend: str = "llama",
+                        port: int = None, host: str = None):
+    if backend == "llama":
+        content = GOOSE_WRAPPER_LLAMA.format(
+            alias=alias,
+            host=host or LLAMA_SERVER_HOST,
+            port=port or LLAMA_SERVER_PORT,
+        )
+    else:
+        content = GOOSE_WRAPPER_OLLAMA.format(
+            alias=alias,
+            port=port or OLLAMA_DEFAULT_PORT,
+        )
+    GOOSE_WRAPPER.write_text(content)
+    GOOSE_WRAPPER.chmod(0o755)
+    print(f"[goose] Wrapper written: {GOOSE_WRAPPER}  (backend={backend}, model={alias})")
 
 
-def _get_release_asset_url() -> str | None:
+def _find_release_asset() -> str | None:
     try:
-        req = urllib.request.Request(GOOSE_RELEASES_URL,
-                                     headers={"User-Agent": "local-coder-setup"})
+        req = urllib.request.Request(
+            GOOSE_RELEASES_URL, headers={"User-Agent": "local-coder"}
+        )
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
         for asset in data.get("assets", []):
             name = asset["name"].lower()
-            if "linux" in name and ("x86_64" in name or "amd64" in name) and name.endswith((".tar.gz", ".gz", "")):
+            if "linux" in name and ("x86_64" in name or "amd64" in name or "x64" in name):
                 return asset["browser_download_url"]
     except Exception as e:
         print(f"[goose] Release fetch failed: {e}")
