@@ -54,17 +54,9 @@ def write_goose_wrapper(alias: str, backend: str = "llama",
 
 
 def _write_wrapper(path, content: str):
-    import subprocess, tempfile
-    try:
-        path.write_text(content)
-        path.chmod(0o755)
-    except PermissionError:
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sh") as f:
-            f.write(content)
-            tmp = f.name
-        subprocess.run(["sudo", "cp", tmp, str(path)], check=True)
-        subprocess.run(["sudo", "chmod", "+x", str(path)], check=True)
-        Path(tmp).unlink(missing_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    path.chmod(0o755)
 
 
 def _find_release_asset() -> str | None:

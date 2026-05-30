@@ -21,8 +21,8 @@ OLLAMA_DOCKER_IMAGE = "ollama/ollama:0.9.0"
 OLLAMA_DOCKER_CONTAINER = "local-coder-ollama"
 OLLAMA_DOCKER_VOLUME = "local-coder-ollama-data"
 
-# Wrapper script paths
-WRAPPER_DIR = Path("/usr/local/bin")
+# Wrapper script paths — ~/.local/bin is user-writable and on PATH after install
+WRAPPER_DIR = Path.home() / ".local" / "bin"
 AIDER_WRAPPER = WRAPPER_DIR / "aider-local"
 GOOSE_WRAPPER = WRAPPER_DIR / "goose-local"
 
@@ -103,15 +103,17 @@ GOOSE_WRAPPER_LLAMA = """\
 GOOSE="$HOME/.local/bin/goose"
 export OPENAI_API_KEY=none
 export OPENAI_BASE_URL=http://{host}:{port}/v1
+export GOOSE_PROVIDER=openai
+export GOOSE_MODEL={alias}
 if [[ "$1" == "run" ]]; then
     shift
     exec $GOOSE run \\
         --provider openai --model {alias} \\
-        --no-profile --with-builtin developer \\
+        --with-builtin developer \\
         "$@"
 else
     exec $GOOSE session \\
-        --provider openai --model {alias} \\
+        --no-profile --with-builtin developer \\
         "$@"
 fi
 """
@@ -130,15 +132,17 @@ exec aider --model ollama/{alias} \\
 GOOSE_WRAPPER_OLLAMA = """\
 #!/usr/bin/env bash
 GOOSE="$HOME/.local/bin/goose"
+export GOOSE_PROVIDER=ollama
+export GOOSE_MODEL={alias}
 if [[ "$1" == "run" ]]; then
     shift
     exec $GOOSE run \\
         --provider ollama --model {alias} \\
-        --no-profile --with-builtin developer \\
+        --with-builtin developer \\
         "$@"
 else
     exec $GOOSE session \\
-        --provider ollama --model {alias} \\
+        --no-profile --with-builtin developer \\
         "$@"
 fi
 """
