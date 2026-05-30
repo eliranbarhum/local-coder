@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
 import zipfile
@@ -33,28 +34,62 @@ def download_binary() -> bool:
         return False
 
     BIN_DIR.mkdir(parents=True, exist_ok=True)
-    zip_path = BIN_DIR / asset_name
+    archive_path = BIN_DIR / asset_name
 
     print(f"[llama] Downloading {asset_name}...")
-    _download_with_progress(asset_url, zip_path)
+    _download_with_progress(asset_url, archive_path)
 
     print("[llama] Extracting llama-server...")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        candidates = [n for n in zf.namelist() if n.endswith("llama-server") or n.endswith("llama-server.exe")]
-        if not candidates:
-            # newer releases use 'llama-server' at root or in bin/
-            candidates = [n for n in zf.namelist() if "llama-server" in n]
-        if not candidates:
-            print(f"[llama] llama-server not found in archive. Contents: {zf.namelist()[:10]}")
-            return False
-        member = candidates[0]
-        data = zf.read(member)
-        LLAMA_BIN.write_bytes(data)
-        LLAMA_BIN.chmod(0o755)
+    found_binary = False
+    if asset_name.endswith(".tar.gz") or asset_name.endswith(".tgz"):
+        with tarfile.open(archive_path, "r:gz") as tf:
+            members = tf.getmembers()
+            for m in members:
+                if not m.isfile():
+                    continue
+                basename = Path(m.name).name
+                dest = BIN_DIR / basename
+                f = tf.extractfile(m)
+                if f is None:
+                    continue
+                dest.write_bytes(f.read())
+                if basename == "llama-server":
+                    dest.chmod(0o755)
+                    found_binary = True
+                elif basename.endswith(".so") or basename.endswith(".dylib"):
+                    dest.chmod(0o644)
+    else:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for name in zf.namelist():
+                basename = Path(name).name
+                if not basename:
+                    continue
+                dest = BIN_DIR / basename
+                dest.write_bytes(zf.read(name))
+                if basename == "llama-server":
+                    dest.chmod(0o755)
+                    found_binary = True
+                elif basename.endswith(".so") or basename.endswith(".dylib"):
+                    dest.chmod(0o644)
 
-    zip_path.unlink()
+    archive_path.unlink()
+    if not found_binary:
+        print("[llama] llama-server not found in archive.")
+        return False
+    _create_soname_symlinks()
     print(f"[llama] Binary installed at {LLAMA_BIN}")
     return True
+
+
+def _create_soname_symlinks():
+    """Create .so.N symlinks for versioned shared libraries (e.g. libfoo.so.1.2.3 → libfoo.so.1)."""
+    import re
+    for p in BIN_DIR.glob("*.so.*"):
+        m = re.match(r"^(.+\.so\.\d+)\.\d+\.\d+$", p.name)
+        if m:
+            link = BIN_DIR / m.group(1)
+            if not link.exists():
+                link.symlink_to(p.name)
 
 
 def start_server(model_path: Path, ctx_size: int, port=LLAMA_SERVER_PORT,
@@ -82,8 +117,10 @@ def start_server(model_path: Path, ctx_size: int, port=LLAMA_SERVER_PORT,
         "--log-disable",
     ]
 
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = str(BIN_DIR) + ":" + env.get("LD_LIBRARY_PATH", "")
     print(f"[llama] Starting server (model={model_path.name}, ctx={ctx_size}, threads={threads})...")
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(proc.pid))
 
@@ -113,7 +150,7 @@ def is_running(port=LLAMA_SERVER_PORT) -> bool:
         return False
 
 
-def _wait_for_server(port, timeout=60) -> bool:
+def _wait_for_server(port, timeout=120) -> bool:
     print("[llama] Waiting for server", end="", flush=True)
     for _ in range(timeout):
         if is_running(port):
@@ -144,7 +181,12 @@ def _find_release_asset() -> tuple[str, str]:
             data = json.loads(r.read())
         for asset in data.get("assets", []):
             name = asset["name"].lower()
-            if "linux" in name and ("x64" in name or "amd64" in name or "x86_64" in name) and name.endswith(".zip"):
+            is_linux = "linux" in name or "ubuntu" in name
+            is_x64 = "x64" in name or "amd64" in name or "x86_64" in name
+            is_archive = name.endswith(".zip") or name.endswith(".tar.gz") or name.endswith(".tgz")
+            # Skip GPU-specific builds (rocm, cuda, vulkan, openvino) for the default CPU build
+            is_gpu = any(g in name for g in ("rocm", "cuda", "vulkan", "openvino", "hip"))
+            if is_linux and is_x64 and is_archive and not is_gpu:
                 return asset["browser_download_url"], asset["name"]
     except Exception as e:
         print(f"[llama] GitHub API error: {e}")

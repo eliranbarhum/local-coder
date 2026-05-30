@@ -49,9 +49,22 @@ def write_goose_wrapper(alias: str, backend: str = "llama",
             alias=alias,
             port=port or OLLAMA_DEFAULT_PORT,
         )
-    GOOSE_WRAPPER.write_text(content)
-    GOOSE_WRAPPER.chmod(0o755)
+    _write_wrapper(GOOSE_WRAPPER, content)
     print(f"[goose] Wrapper written: {GOOSE_WRAPPER}  (backend={backend}, model={alias})")
+
+
+def _write_wrapper(path, content: str):
+    import subprocess, tempfile
+    try:
+        path.write_text(content)
+        path.chmod(0o755)
+    except PermissionError:
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sh") as f:
+            f.write(content)
+            tmp = f.name
+        subprocess.run(["sudo", "cp", tmp, str(path)], check=True)
+        subprocess.run(["sudo", "chmod", "+x", str(path)], check=True)
+        Path(tmp).unlink(missing_ok=True)
 
 
 def _find_release_asset() -> str | None:

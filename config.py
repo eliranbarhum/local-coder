@@ -16,6 +16,7 @@ LLAMA_GITHUB_REPO = "ggml-org/llama.cpp"
 
 # Ollama (optional backend)
 OLLAMA_DEFAULT_PORT = 11434
+OLLAMA_MIN_VERSION = "0.3.0"
 OLLAMA_DOCKER_IMAGE = "ollama/ollama:0.9.0"
 OLLAMA_DOCKER_CONTAINER = "local-coder-ollama"
 OLLAMA_DOCKER_VOLUME = "local-coder-ollama-data"
